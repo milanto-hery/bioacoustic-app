@@ -5,7 +5,5 @@ numpy
 pandas
 plotly
 soundfile
-perch-hoplite[tf]>=1.0.2,<2
-tensorflow>=2.20,<2.22
-resampy
-scipy
+tensorflow-cpu
+perch-hoplite
