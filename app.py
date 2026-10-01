@@ -118,12 +118,23 @@ def load_perch_model_and_taxonomy():
         raise RuntimeError("The Perch model did not provide its ordered species labels.")
 
     taxonomy = namespace_db.load_db()
-    scientific_names = {
-        species_code: scientific_name
-        for scientific_name, species_code in taxonomy.mappings[
-            "clements_to_species"
-        ].mapped_pairs.items()
-    }
+    scientific_names_by_namespace = {}
+    all_scientific_names = {}
+    for mapping_name in (
+        "ebird2021_clements_to_species",
+        "ebird2022_clements_to_species",
+    ):
+        mapping = taxonomy.mappings[mapping_name]
+        names_by_code = {
+            species_code: scientific_name
+            for scientific_name, species_code in mapping.mapped_pairs.items()
+        }
+        scientific_names_by_namespace[mapping.target_namespace] = names_by_code
+        all_scientific_names.update(names_by_code)
+
+    scientific_names = scientific_names_by_namespace.get(
+        class_list.namespace, all_scientific_names
+    )
     return model, class_list.classes, scientific_names
 
 
