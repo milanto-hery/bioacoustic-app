@@ -6,6 +6,6 @@ pandas
 plotly
 soundfile
 birdnetlib
-tflite-runtime
+tensorflow-cpu
 resampy
 scipy
