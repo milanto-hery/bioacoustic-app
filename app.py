@@ -298,7 +298,7 @@ if uploaded_file is not None:
             # Visual Analytics Section
             chart_col1, chart_col2 = st.columns(2)
             with chart_col1:
-                st.subheader("📊 Avian Relative Abundance")
+                st.subheader("📊 Detected Species by Count")
                 spec_counts = filtered_df["Species"].value_counts().reset_index()
                 spec_counts.columns = ["Species", "Detection Count"]
                 fig_pie = px.pie(
@@ -323,7 +323,7 @@ if uploaded_file is not None:
                 st.plotly_chart(fig_scatter, use_container_width=True)
                 
         else:
-            st.warning("⚠️ No avian vocalizations recognized above the chosen confidence threshold. Try lowering the slider in the sidebar.")
+            st.warning("No species detections passed the selected Perch model-score threshold. Try lowering the slider in the sidebar.")
 
     # -------------------------------------------------------------------------
     # TAB 2: HIGH-RES WAVEFORM & SPECTROGRAM VIEWER
