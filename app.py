@@ -5,7 +5,6 @@ import librosa
 import librosa.display
 import matplotlib.pyplot as plt
 import plotly.express as px
-import plotly.graph_objects as io
 import plotly.graph_objects as go
 import io
 import soundfile as sf
@@ -312,7 +311,13 @@ if y is not None:
         # Plot 2: Mel-Spectrogram
         S = librosa.feature.melspectrogram(y=y_slice, sr=sr, n_mels=128, fmax=8000)
         S_dB = librosa.power_to_db(S, ref=np.max)
-        img = librosa.display.specshow(S_dB, x_axis='time', y_axis='mel', sr=sr, fmax=8000, ax=ax2, cmap=colormap_choice, x_coords=time_axis)
+        
+        # Correctly align Spectrogram time axis matching S_dB matrix shape
+        spec_time_axis = np.linspace(start_sec, end_sec, S_dB.shape[1])
+        img = librosa.display.specshow(
+            S_dB, x_axis='time', y_axis='mel', sr=sr, fmax=8000, 
+            ax=ax2, cmap=colormap_choice, x_coords=spec_time_axis
+        )
         ax2.set_ylabel("Frequency (Hz)")
         ax2.set_xlabel("Time (Seconds)")
         ax2.set_title("Mel-Spectrogram Visualization")
