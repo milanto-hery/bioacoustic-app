@@ -7,3 +7,5 @@ plotly
 soundfile
 resampy
 scipy
+birdnetlib
+tensorflow-cpu 
