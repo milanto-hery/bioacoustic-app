@@ -314,7 +314,7 @@ if uploaded_file is not None:
                     "Timestamp", "Species", "Model Label",
                     "Model Score (%)", "Acoustic Model Engine"
                 ]],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
             
@@ -350,7 +350,7 @@ if uploaded_file is not None:
                     color_discrete_sequence=px.colors.qualitative.Dark24
                 )
                 fig_pie.update_layout(margin=dict(t=20, b=20, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig_pie, use_container_width=True)
+                st.plotly_chart(fig_pie, width="stretch")
                 
             with chart_col2:
                 st.subheader("⏱️ Temporal Detection Timeline")
@@ -364,7 +364,7 @@ if uploaded_file is not None:
                     labels={"Start Time (s)": "Time (Seconds)", "Species": "Identified Species"}
                 )
                 fig_scatter.update_layout(margin=dict(t=20, b=20, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
-                st.plotly_chart(fig_scatter, use_container_width=True)
+                st.plotly_chart(fig_scatter, width="stretch")
                 
         else:
             st.warning("No species detections passed the selected Perch model-score threshold. Try lowering the slider in the sidebar.")
