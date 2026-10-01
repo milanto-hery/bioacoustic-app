@@ -5,3 +5,8 @@ numpy
 pandas
 plotly
 soundfile
+birdnetlib
+transformers
+torch
+resampy
+scipy
