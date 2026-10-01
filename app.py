@@ -5,18 +5,24 @@ import librosa
 import librosa.display
 import matplotlib.pyplot as plt
 import plotly.express as px
-import plotly.graph_objects as go
 import io
 import soundfile as sf
-import datetime
 import os
 import tempfile
+
+# Try importing birdnetlib for real AI inference when deployed
+try:
+    from birdnetlib import Recording
+    from birdnetlib.models import BirdNETModel
+    BIRDNET_AVAILABLE = True
+except ImportError:
+    BIRDNET_AVAILABLE = False
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="AcoustiSpec Pro | Enterprise AI Bioacoustics Workstation",
+    page_title="AcoustiSpec Pro | BirdNET AI Bioacoustics Workstation",
     page_icon="🦅",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -43,21 +49,6 @@ st.markdown("""
         margin-bottom: 1.5rem;
         font-weight: 400;
     }
-    .metric-card {
-        background-color: #FFFFFF;
-        padding: 1.2rem;
-        border-radius: 0.75rem;
-        border: 1px solid #E2E8F0;
-        box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
-    }
-    .status-badge {
-        background-color: #0284C7;
-        color: #FFFFFF;
-        padding: 0.25rem 0.75rem;
-        border-radius: 9999px;
-        font-size: 0.8rem;
-        font-weight: 600;
-    }
     .stApp {
         background-color: #F8FAFC;
     }
@@ -65,7 +56,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# CORE AUDIO & AI INFERENCE PIPELINE
+# CORE AUDIO INGESTION & BIRDNET INFERENCE PIPELINE
 # -----------------------------------------------------------------------------
 
 @st.cache_data
@@ -74,23 +65,19 @@ def load_audio_fast(file_bytes):
     Fast cached audio ingestion using Native Sample Rate to avoid CPU resampling bottlenecks.
     """
     y, sr = librosa.load(io.BytesIO(file_bytes), sr=None)
-    # Ensure float32 normalized audio
     if y.dtype != np.float32:
         y = y.astype(np.float32)
     return y, sr
 
 def calculate_audio_telemetry(y, sr):
     """
-    Computes rigorous audio quality and ecoacoustic metrics.
+    Computes audio quality and ecoacoustic metrics.
     """
     duration = float(librosa.get_duration(y=y, sr=sr))
     rms = float(np.sqrt(np.mean(y**2)))
-    # Estimate Signal-to-Noise Ratio (SNR)
     signal_power = np.mean(y**2)
     noise_power = np.percentile(y**2, 10) + 1e-10
     snr_db = float(10 * np.log10(signal_power / noise_power))
-    
-    # Spectral Centroid
     cent = librosa.feature.spectral_centroid(y=y, sr=sr)
     mean_centroid = float(np.mean(cent))
     
@@ -102,64 +89,64 @@ def calculate_audio_telemetry(y, sr):
         "sample_rate": sr
     }
 
-@st.cache_resource
-def load_birdnet_analyzer():
+def run_birdnet_inference(file_bytes, file_suffix, min_conf=0.25, lat=None, lon=None):
+    """
+    Executes true BirdNET model inference via birdnetlib.
+    Extracts raw species predictions directly from BirdNET neural network weights.
+    """
+    if not BIRDNET_AVAILABLE:
+        st.error("⚠️ `birdnetlib` library is not installed in the environment. Please ensure `birdnetlib` is listed in your `requirements.txt`.")
+        return pd.DataFrame()
+
+    # Save audio bytes to a temporary file on disk as required by birdnetlib
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp_file:
+        tmp_file.write(file_bytes)
+        tmp_path = tmp_file.name
+
     try:
-        from birdnetlib.analyzer import Analyzer
-    except ImportError as error:
-        raise RuntimeError(
-            "BirdNET is not installed in the active Python environment. "
-            "Install this project's requirements.txt before running inference."
-        ) from error
+        # Load BirdNET Model Weights
+        model = BirdNETModel()
+        
+        # Configure Recording
+        recording = Recording(
+            model,
+            tmp_path,
+            lat=lat if (lat is not None and lat != 0.0) else None,
+            lon=lon if (lon is not None and lon != 0.0) else None,
+            min_conf=min_conf
+        )
+        
+        # Run neural network extraction
+        recording.extract_detections()
+        raw_detections = recording.detections
 
-    return Analyzer()
+        if not raw_detections:
+            return pd.DataFrame()
 
-
-def run_birdnet_inference(audio_data, sr, confidence_threshold, region=None):
-    try:
-        from birdnetlib import Recording
-    except ImportError as error:
-        raise RuntimeError(
-            "BirdNET is not installed in the active Python environment. "
-            "Install this project's requirements.txt before running inference."
-        ) from error
-
-    analyzer = load_birdnet_analyzer()
-    detections = []
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        audio_path = os.path.join(temp_dir, "uploaded_audio.wav")
-        sf.write(audio_path, np.asarray(audio_data, dtype=np.float32), sr)
-        recording_options = {
-            "date": datetime.date.today().isoformat(),
-            "min_conf": confidence_threshold,
-        }
-        if region is not None:
-            recording_options.update({"lat": region[0], "lon": region[1]})
-
-        recording = Recording(analyzer, audio_path, **recording_options)
-        recording.analyze()
-
-        for index, result in enumerate(recording.detections, start=1):
-            start_time = float(result.get("start_time", 0.0))
-            end_time = float(result.get("end_time", start_time))
-            common_name = result.get("common_name") or result.get("label") or result.get("scientific_name") or "Unknown"
-            scientific_name = result.get("scientific_name") or ""
-            detections.append({
-                "Segment ID": index,
-                "Start Time (s)": round(start_time, 2),
-                "End Time (s)": round(end_time, 2),
-                "Timestamp": f"{int(start_time // 60):02d}:{int(start_time % 60):02d} - {int(end_time // 60):02d}:{int(end_time % 60):02d}",
-                "Common Name": common_name,
-                "Scientific Name": scientific_name,
-                "Confidence (%)": round(float(result.get("confidence", 0.0)) * 100, 1),
-                "Acoustic Model Engine": "BirdNET",
+        # Format detections into clean DataFrame
+        formatted = []
+        for idx, d in enumerate(raw_detections):
+            start_s = d.get("start_time", 0.0)
+            end_s = d.get("end_time", 0.0)
+            formatted.append({
+                "Detection ID": idx + 1,
+                "Start Time (s)": round(start_s, 2),
+                "End Time (s)": round(end_s, 2),
+                "Timestamp": f"{int(start_s//60):02d}:{int(start_s%60):02d} - {int(end_s//60):02d}:{int(end_s%60):02d}",
+                "Common Name": d.get("common_name", "Unknown Species"),
+                "Scientific Name": d.get("scientific_name", "N/A"),
+                "Confidence (%)": round(d.get("confidence", 0.0) * 100, 1),
+                "Acoustic Model Engine": "BirdNET-Analyzer V2.4 (Cornell Lab)"
             })
 
-    return pd.DataFrame(detections, columns=[
-        "Segment ID", "Start Time (s)", "End Time (s)", "Timestamp",
-        "Common Name", "Scientific Name", "Confidence (%)", "Acoustic Model Engine",
-    ])
+        return pd.DataFrame(formatted)
+
+    except Exception as e:
+        st.error(f"Error during BirdNET inference: {str(e)}")
+        return pd.DataFrame()
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 # -----------------------------------------------------------------------------
 # SIDEBAR CONTROLS & MODEL CONFIGURATION
@@ -169,9 +156,8 @@ st.sidebar.markdown("### 🦅 AcoustiSpec AI Workstation")
 st.sidebar.caption("Enterprise Bioacoustics Analysis & Avian Monitoring")
 st.sidebar.divider()
 
-st.sidebar.subheader("🤖 Species Classifier")
-st.sidebar.markdown("**BirdNET**")
-st.sidebar.caption("Predicted species names and confidence scores come directly from BirdNET.")
+st.sidebar.markdown("**🤖 AI Classifier Engine**")
+st.sidebar.info("Using **BirdNET-Analyzer V2.4** (Cornell Lab of Ornithology)")
 
 # Audio Upload
 st.sidebar.subheader("📁 Audio Source Ingestion")
@@ -182,16 +168,18 @@ uploaded_file = st.sidebar.file_uploader(
 
 # Detection Hyperparameters
 st.sidebar.subheader("⚙️ Detection Hyperparameters")
-conf_threshold = st.sidebar.slider("Minimum Confidence Threshold (%)", min_value=15, max_value=95, value=35, step=5) / 100.0
+conf_threshold = st.sidebar.slider("Minimum Confidence Threshold (%)", min_value=10, max_value=95, value=25, step=5) / 100.0
 spectrogram_cmap = st.sidebar.selectbox("Spectrogram Colormap", ["magma", "viridis", "inferno", "plasma", "cividis"], index=0)
 
-use_geo_filter = st.sidebar.checkbox("Use regional BirdNET filter", value=False)
-region = None
-if use_geo_filter:
-    region_col1, region_col2 = st.sidebar.columns(2)
-    latitude = region_col1.number_input("Latitude", min_value=-90.0, max_value=90.0, value=-18.9, step=0.1)
-    longitude = region_col2.number_input("Longitude", min_value=-180.0, max_value=180.0, value=47.5, step=0.1)
-    region = (latitude, longitude)
+# Optional Geographic Filter Inputs
+st.sidebar.subheader("📍 Geographic Location Filter (Optional)")
+use_geo = st.sidebar.checkbox("Enable Coordinates Filter", value=False)
+lat_input = 0.0
+lon_input = 0.0
+if use_geo:
+    lat_input = st.sidebar.number_input("Latitude", value=-18.8792, format="%.4f")
+    lon_input = st.sidebar.number_input("Longitude", value=47.5079, format="%.4f")
+    st.sidebar.caption("Filters BirdNET predictions to species native to specified coordinates.")
 
 # -----------------------------------------------------------------------------
 # MAIN APPLICATION WORKSPACE
@@ -201,21 +189,24 @@ st.markdown('<div class="main-header">🎙️ AcoustiSpec Pro — Bioacoustics A
 st.markdown('<div class="sub-header">Automated wildlife vocalization identification, acoustic feature telemetry, and high-density spectrogram analysis</div>', unsafe_allow_html=True)
 
 if uploaded_file is not None:
-    audio_bytes = uploaded_file.read()
+    file_bytes = uploaded_file.read()
     filename = uploaded_file.name
+    _, file_ext = os.path.splitext(filename)
+    if not file_ext:
+        file_ext = ".wav"
     
     with st.spinner("⚡ Ingesting audio stream and computing acoustic telemetry..."):
-        y, sr = load_audio_fast(audio_bytes)
+        y, sr = load_audio_fast(file_bytes)
         telemetry = calculate_audio_telemetry(y, sr)
         
-    try:
-        with st.spinner("🧠 Running BirdNET classification..."):
-            df_detections = run_birdnet_inference(
-                y, sr, confidence_threshold=conf_threshold, region=region
-            )
-    except Exception as error:
-        st.error(f"BirdNET inference failed: {error}")
-        st.stop()
+    with st.spinner("🧠 Executing BirdNET-Analyzer V2.4 inference..."):
+        df_detections = run_birdnet_inference(
+            file_bytes=file_bytes,
+            file_suffix=file_ext,
+            min_conf=conf_threshold,
+            lat=lat_input if use_geo else None,
+            lon=lon_input if use_geo else None
+        )
         
     # -------------------------------------------------------------------------
     # TOP TELEMETRY METRICS BAR
@@ -249,10 +240,9 @@ if uploaded_file is not None:
     # TAB 1: DETECTION LOG & SPECIES IDENTIFICATION
     # -------------------------------------------------------------------------
     with tab1:
-        st.subheader("🦅 AI Species Detection Summary")
+        st.subheader("🦅 BirdNET Species Identification Log")
         
         if not df_detections.empty:
-            # Filter bar
             f_col1, f_col2 = st.columns([3, 1])
             with f_col1:
                 species_filter = st.multiselect(
@@ -261,19 +251,17 @@ if uploaded_file is not None:
                     default=list(df_detections["Common Name"].unique())
                 )
             with f_col2:
-                sort_order = st.selectbox("Sort By:", ["Timestamp", "Confidence (%)", "Common Name"])
+                sort_order = st.selectbox("Sort By:", ["Timestamp", "Confidence (%)"])
                 
             filtered_df = df_detections[df_detections["Common Name"].isin(species_filter)].copy()
             
             if sort_order == "Confidence (%)":
                 filtered_df = filtered_df.sort_values(by="Confidence (%)", ascending=False)
-            elif sort_order == "Common Name":
-                filtered_df = filtered_df.sort_values(by="Common Name")
 
-            # Display Data Table
+            # Display Data Table directly returned by BirdNET
             st.dataframe(
                 filtered_df[[
-                    "Timestamp", "Common Name", "Scientific Name",
+                    "Timestamp", "Common Name", "Scientific Name", 
                     "Confidence (%)", "Acoustic Model Engine"
                 ]],
                 use_container_width=True,
@@ -287,31 +275,31 @@ if uploaded_file is not None:
                 st.download_button(
                     label="📥 Export Detection Report (CSV)",
                     data=csv_data,
-                    file_name=f"AcoustiSpec_Report_{filename}.csv",
+                    file_name=f"BirdNET_Report_{filename}.csv",
                     mime="text/csv"
                 )
             with exp_col2:
                 json_data = filtered_df.to_json(orient="records", indent=2)
                 st.download_button(
-                    label="📥 Export Acoustic Metadata (JSON)",
+                    label="📥 Export Detections (JSON)",
                     data=json_data,
-                    file_name=f"AcoustiSpec_Metadata_{filename}.json",
+                    file_name=f"BirdNET_Metadata_{filename}.json",
                     mime="application/json"
                 )
                 
             st.divider()
             
-            # Visual Analytics Section
+            # Visual Charts
             chart_col1, chart_col2 = st.columns(2)
             with chart_col1:
-                st.subheader("📊 Avian Relative Abundance")
-                spec_counts = filtered_df["Common Name"].value_counts().reset_index()
-                spec_counts.columns = ["Species", "Detection Count"]
+                st.subheader("📊 Species Relative Abundance")
+                species_counts = filtered_df["Common Name"].value_counts().reset_index()
+                species_counts.columns = ["Species", "Detections"]
                 fig_pie = px.pie(
-                    spec_counts, values="Detection Count", names="Species", hole=0.45,
-                    color_discrete_sequence=px.colors.qualitative.Dark24
+                    species_counts, values="Detections", names="Species", hole=0.4,
+                    color_discrete_sequence=px.colors.qualitative.Bold
                 )
-                fig_pie.update_layout(margin=dict(t=20, b=20, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)")
+                fig_pie.update_layout(margin=dict(t=20, b=20, l=20, r=20))
                 st.plotly_chart(fig_pie, use_container_width=True)
                 
             with chart_col2:
@@ -322,107 +310,95 @@ if uploaded_file is not None:
                     y="Common Name",
                     size="Confidence (%)",
                     color="Common Name",
-                    hover_data=["Scientific Name", "Confidence (%)"],
-                    labels={"Start Time (s)": "Time (Seconds)", "Common Name": "Identified Species"}
+                    hover_data=["Scientific Name", "Timestamp", "Confidence (%)"],
+                    labels={"Start Time (s)": "Time (Seconds)", "Common Name": "Detected Species"}
                 )
-                fig_scatter.update_layout(margin=dict(t=20, b=20, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
+                fig_scatter.update_layout(margin=dict(t=20, b=20, l=20, r=20), showlegend=False)
                 st.plotly_chart(fig_scatter, use_container_width=True)
-                
         else:
-            st.warning("⚠️ No avian vocalizations recognized above the chosen confidence threshold. Try lowering the slider in the sidebar.")
+            st.warning("⚠️ No vocalizations recognized by BirdNET above the chosen confidence threshold. Try adjusting the Minimum Confidence Threshold slider in the sidebar.")
 
     # -------------------------------------------------------------------------
-    # TAB 2: HIGH-RES WAVEFORM & SPECTROGRAM VIEWER
+    # TAB 2: WAVEFORM & SPECTROGRAM VIEWER
     # -------------------------------------------------------------------------
     with tab2:
-        st.subheader("🎚️ Spectral Waveform & Mel-Spectrogram Inspection")
+        st.subheader("🎚️ Interactive Time-Frequency Inspector")
         
-        # Window Slider
-        start_time, end_time = st.slider(
-            "Select Temporal Inspection Window (Seconds):",
+        duration_total = telemetry["duration"]
+        start_sec, end_sec = st.slider(
+            "Select Time Slice to Inspect (Seconds):",
             min_value=0.0,
-            max_value=telemetry["duration"],
-            value=(0.0, min(10.0, telemetry["duration"])),
+            max_value=float(duration_total),
+            value=(0.0, min(10.0, float(duration_total))),
             step=0.5
         )
         
-        # Audio Player Segment
-        start_s = int(start_time * sr)
-        end_s = int(end_time * sr)
-        y_slice = y[start_s:end_s]
+        start_samp = int(start_sec * sr)
+        end_samp = int(end_sec * sr)
+        y_slice = y[start_samp:end_samp]
         
-        st.markdown(f"🔊 **Playback Window (`{start_time:.1f}s` to `{end_time:.1f}s`):**")
+        st.write(f"🔊 **Playing Audio Segment ({start_sec:.1f}s - {end_sec:.1f}s):**")
         buf = io.BytesIO()
         sf.write(buf, y_slice, sr, format='WAV')
         st.audio(buf.getvalue(), format="audio/wav")
         
-        # Matplotlib High-Res Dual Plot
-        fig, (ax_wave, ax_spec) = plt.subplots(2, 1, figsize=(12, 6.5), sharex=True, gridspec_kw={'height_ratios': [1, 2]})
-        fig.patch.set_facecolor('#F8FAFC')
+        # Generate Dual Figure
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
         
-        # Waveform Plot
-        t_axis = np.linspace(start_time, end_time, len(y_slice))
-        ax_wave.plot(t_axis, y_slice, color="#0284C7", alpha=0.85, linewidth=0.8)
-        ax_wave.set_ylabel("Amplitude", fontsize=9, fontweight='bold', color='#334155')
-        ax_wave.set_title(f"Acoustic Waveform ({start_time:.1f}s - {end_time:.1f}s)", fontsize=11, fontweight='bold', color='#0F172A')
-        ax_wave.grid(True, linestyle="--", alpha=0.4)
-        ax_wave.set_facecolor('#FFFFFF')
+        time_axis = np.linspace(start_sec, end_sec, len(y_slice))
+        ax1.plot(time_axis, y_slice, color="#0284C7", alpha=0.85, linewidth=1)
+        ax1.set_ylabel("Amplitude")
+        ax1.set_title(f"Audio Waveform Segment ({start_sec:.1f}s - {end_sec:.1f}s)")
+        ax1.grid(True, linestyle="--", alpha=0.4)
         
-        # Spectrogram Plot
-        S_slice = librosa.feature.melspectrogram(y=y_slice, sr=sr, n_mels=128, fmax=min(12000, sr//2))
-        S_dB_slice = librosa.power_to_db(S_slice, ref=np.max)
-        spec_time_axis = np.linspace(start_time, end_time, S_dB_slice.shape[1])
+        S = librosa.feature.melspectrogram(y=y_slice, sr=sr, n_mels=128, fmax=min(12000, sr//2))
+        S_dB = librosa.power_to_db(S, ref=np.max)
         
+        spec_time_axis = np.linspace(start_sec, end_sec, S_dB.shape[1])
         img = librosa.display.specshow(
-            S_dB_slice, x_axis='time', y_axis='mel', sr=sr, fmax=min(12000, sr//2),
-            ax=ax_spec, cmap=spectrogram_cmap, x_coords=spec_time_axis
+            S_dB, x_axis='time', y_axis='mel', sr=sr, fmax=min(12000, sr//2),
+            ax=ax2, cmap=spectrogram_cmap, x_coords=spec_time_axis
         )
-        ax_spec.set_ylabel("Frequency (Hz)", fontsize=9, fontweight='bold', color='#334155')
-        ax_spec.set_xlabel("Time (Seconds)", fontsize=9, fontweight='bold', color='#334155')
-        ax_spec.set_title("Mel-Spectrogram Energy Density Plot", fontsize=11, fontweight='bold', color='#0F172A')
-        ax_spec.set_facecolor('#FFFFFF')
-        fig.colorbar(img, ax=ax_spec, format='%+2.0f dB')
+        ax2.set_ylabel("Frequency (Hz)")
+        ax2.set_xlabel("Time (Seconds)")
+        ax2.set="Mel-Spectrogram Energy Distribution"
+        fig.colorbar(img, ax=ax2, format='%+2.0f dB')
         
-        plt.tight_layout()
         st.pyplot(fig)
 
     # -------------------------------------------------------------------------
-    # TAB 3: SOUNDSCAPE ANALYTICS & ABUNDANCE
+    # TAB 3: SOUNDSCAPE ANALYTICS
     # -------------------------------------------------------------------------
     with tab3:
-        st.subheader("📊 Ecoacoustic Soundscape Indices & Acoustic Complexity")
+        st.subheader("📊 Acoustic Feature Telemetry & Metrics")
         
-        sc1, sc2, sc3 = st.columns(3)
-        with sc1:
-            st.metric("🎵 Acoustic Complexity Index (ACI)", "184.2", delta="+12.4 vs Ambient")
-        with sc2:
-            st.metric("🌿 Bioacoustic Index (BI)", "8.94", delta="High Biophony")
-        with sc3:
-            st.metric("🌐 Soundscape Index (NDSI)", "+0.72", delta="Natural Canopy Dominance")
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            st.info(f"**Root Mean Square (RMS):** `{telemetry['rms']:.5f}`")
+        with s2:
+            st.info(f"**Spectral Centroid:** `{telemetry['mean_centroid_hz']:.1f} Hz`")
+        with s3:
+            st.info(f"**Estimated Signal SNR:** `{telemetry['snr_db']:.2f} dB`")
             
-        st.divider()
         st.markdown("""
-        #### 📌 Soundscape Health Metrics
-        - **Acoustic Complexity Index (ACI):** Measures the relative variability in intensity across frequency bins. High values signify rich species vocal activity.
-        - **Bioacoustic Index (BI):** Calculates the area under the mean spectrum in the biophonic range (2–8 kHz).
-        - **Normalized Difference Soundscape Index (NDSI):** Evaluates biophony vs anthrophony ratio (-1 = human noise, +1 = natural soundscape).
+        ### 🌿 Bioacoustic Soundscape Indices
+        - **Acoustic Complexity Index (ACI):** Measures the fluctuation in amplitude in spectrogram frequency bins.
+        - **Bioacoustic Index (BI):** Area under the sound level curve across avian frequency bands (2 kHz - 8 kHz).
+        - **Normalized Difference Soundscape Index (NDSI):** Ratio of biophony (biological sound) to anthrophony (human noise).
         """)
 
     # -------------------------------------------------------------------------
-    # TAB 4: AI ARCHITECTURE & TAXONOMY REFERENCE
+    # TAB 4: AI ARCHITECTURE REFERENCE
     # -------------------------------------------------------------------------
     with tab4:
-        st.subheader("📚 Bioacoustics Models & Avian Taxonomy Architecture")
-        
+        st.subheader("📚 BirdNET-Analyzer V2.4 Architecture")
         st.markdown("""
-        ### BirdNET
-        The dashboard runs the BirdNET model through `birdnetlib`. Species names and confidence values
-        are taken from the model's detections; they are not selected from a local species list or inferred
-        from the uploaded filename. BirdNET's regional filter is optional and uses the coordinates in the sidebar.
-
-        Google Perch and ensemble inference are not configured in this project yet, so they are not presented
-        as selectable models.
+        ### 🦅 BirdNET Neural Network Overview
+        - **Developer:** Cornell Lab of Ornithology & Chemnitz University of Technology.
+        - **Taxonomy Scope:** 6,000+ global avian species.
+        - **Model Inputs:** 3.0-second sliding audio windows converted to mel-spectrograms.
+        - **Inference Pipeline:** Executes convolutional feature extraction (`birdnetlib`) and returns calibrated confidence logits.
         """)
 
 else:
-    st.info("👈 Upload field audio (WAV, MP3, FLAC, OGG) from the sidebar to launch automated bioacoustics analysis.")
+    st.info("👈 Upload an audio file in the sidebar to begin automated BirdNET AI species analysis!")
