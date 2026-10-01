@@ -101,6 +101,24 @@ def calculate_audio_telemetry(y, sr):
         "sample_rate": sr
     }
 
+
+def normalize_perch_frames(framed_audio, target_peak):
+    if target_peak is None:
+        return framed_audio
+
+    centered_audio = framed_audio.copy()
+    centered_audio -= np.mean(centered_audio, axis=-1, keepdims=True)
+    peak_norm = np.max(np.abs(centered_audio), axis=-1, keepdims=True)
+    normalized_audio = np.zeros_like(centered_audio)
+    np.divide(
+        centered_audio,
+        peak_norm,
+        out=normalized_audio,
+        where=peak_norm > 0.0,
+    )
+    return normalized_audio * target_peak
+
+
 @st.cache_resource
 def load_perch_model_and_taxonomy():
     try:
@@ -114,6 +132,7 @@ def load_perch_model_and_taxonomy():
 
     perch_config = model_configs.get_preset_model_config("perch_v2")
     model = perch_config.load_model()
+    model.normalize_audio = normalize_perch_frames
     class_lists = model.class_list
     if not class_lists:
         raise RuntimeError(
@@ -146,62 +165,98 @@ def run_perch_inference(audio_data, sr, score_threshold):
     audio_32k = librosa.resample(
         np.asarray(audio_data, dtype=np.float32), orig_sr=sr, target_sr=PERCH_SAMPLE_RATE
     )
-    outputs = model.embed(audio_32k)
-    if not outputs.logits:
-        raise RuntimeError("Perch did not return species classification scores.")
-
-    logits_key = "label" if "label" in outputs.logits else None
-    if logits_key is None and len(outputs.logits) == 1:
-        logits_key = next(iter(outputs.logits))
-    if logits_key is None:
-        raise RuntimeError(
-            "Perch returned multiple score heads without a 'label' head: "
-            f"{list(outputs.logits)}"
-        )
-
-    logits = np.asarray(outputs.logits[logits_key])
-    matching_class_lists = [
-        class_list
-        for class_list in class_lists.values()
-        if len(class_list.classes) == logits.shape[-1]
-    ]
-    if len(matching_class_lists) != 1:
-        raise RuntimeError(
-            "Could not uniquely match Perch's output scores to its label assets. "
-            f"Output head '{logits_key}' has {logits.shape[-1]} scores; available "
-            f"class lists are {[(key, len(value.classes)) for key, value in class_lists.items()]}"
-        )
-
-    class_list = matching_class_lists[0]
-    labels = class_list.classes
-    scores = logits.reshape(-1, len(labels))
-    scientific_names = scientific_names_by_namespace.get(
-        class_list.namespace, all_scientific_names
-    )
     window_size_seconds = float(model.window_size_s)
     hop_size_seconds = float(model.hop_size_s)
+    window_samples = int(window_size_seconds * PERCH_SAMPLE_RATE)
+    hop_samples = int(hop_size_seconds * PERCH_SAMPLE_RATE)
+    if window_samples <= 0 or hop_samples <= 0:
+        raise RuntimeError("Perch returned an invalid audio window or hop size.")
+
+    frame_starts = list(range(0, len(audio_32k), hop_samples))
+    if not frame_starts:
+        frame_starts = [0]
+
+    batch_size = 8
+    logits_key = None
+    labels = None
+    scientific_names = all_scientific_names
     detections = []
 
-    for frame_index, frame_scores in enumerate(scores):
-        probabilities = 1.0 / (1.0 + np.exp(-np.clip(frame_scores, -80, 80)))
-        start_time = frame_index * hop_size_seconds
-        end_time = start_time + window_size_seconds
-        class_index = int(np.argmax(probabilities))
-        model_score = float(probabilities[class_index])
-        if model_score < score_threshold:
-            continue
+    for batch_start in range(0, len(frame_starts), batch_size):
+        batch_frame_starts = frame_starts[batch_start:batch_start + batch_size]
+        audio_batch = []
+        for start_sample in batch_frame_starts:
+            frame = audio_32k[start_sample:start_sample + window_samples]
+            if len(frame) < window_samples:
+                if start_sample == 0:
+                    frame = librosa.util.pad_center(frame, size=window_samples)
+                else:
+                    frame = np.pad(frame, (0, window_samples - len(frame)))
+            audio_batch.append(frame)
 
-        label = labels[class_index]
-        detections.append({
-            "Segment ID": frame_index + 1,
-            "Start Time (s)": round(start_time, 2),
-            "End Time (s)": round(end_time, 2),
-            "Timestamp": f"{int(start_time // 60):02d}:{int(start_time % 60):02d} - {int(end_time // 60):02d}:{int(end_time % 60):02d}",
-            "Species": scientific_names.get(label, label),
-            "Model Label": label,
-            "Model Score (%)": round(model_score * 100, 1),
-            "Acoustic Model Engine": "Google Perch 2.0",
-        })
+        outputs = model.batch_embed(np.stack(audio_batch))
+        if not outputs.logits:
+            raise RuntimeError("Perch did not return species classification scores.")
+
+        if logits_key is None:
+            logits_key = "label" if "label" in outputs.logits else None
+            if logits_key is None and len(outputs.logits) == 1:
+                logits_key = next(iter(outputs.logits))
+            if logits_key is None:
+                raise RuntimeError(
+                    "Perch returned multiple score heads without a 'label' head: "
+                    f"{list(outputs.logits)}"
+                )
+
+            class_count = np.asarray(outputs.logits[logits_key]).shape[-1]
+            matching_class_lists = [
+                class_list
+                for class_list in class_lists.values()
+                if len(class_list.classes) == class_count
+            ]
+            if len(matching_class_lists) != 1:
+                raise RuntimeError(
+                    "Could not uniquely match Perch's output scores to its label assets. "
+                    f"Output head '{logits_key}' has {class_count} scores; available "
+                    f"class lists are {[(key, len(value.classes)) for key, value in class_lists.items()]}"
+                )
+
+            class_list = matching_class_lists[0]
+            labels = class_list.classes
+            scientific_names = scientific_names_by_namespace.get(
+                class_list.namespace, all_scientific_names
+            )
+
+        batch_logits = np.asarray(outputs.logits[logits_key])
+        batch_scores = batch_logits.reshape(len(batch_frame_starts), -1, len(labels))
+        if batch_scores.shape[1] != 1:
+            raise RuntimeError(
+                "Perch returned more than one result for a single audio window."
+            )
+
+        for batch_index, frame_scores in enumerate(batch_scores[:, 0, :]):
+            probabilities = 1.0 / (1.0 + np.exp(-np.clip(frame_scores, -80, 80)))
+            class_index = int(np.argmax(probabilities))
+            model_score = float(probabilities[class_index])
+            if model_score < score_threshold:
+                continue
+
+            start_time = batch_frame_starts[batch_index] / PERCH_SAMPLE_RATE
+            end_time = min(
+                start_time + window_size_seconds,
+                len(audio_32k) / PERCH_SAMPLE_RATE,
+            )
+            label = labels[class_index]
+            detections.append({
+                "Segment ID": batch_start + batch_index + 1,
+                "Start Time (s)": round(start_time, 2),
+                "End Time (s)": round(end_time, 2),
+                "Timestamp": f"{int(start_time // 60):02d}:{int(start_time % 60):02d} - {int(end_time // 60):02d}:{int(end_time % 60):02d}",
+                "Species": scientific_names.get(label, label),
+                "Model Label": label,
+                "Model Score (%)": round(model_score * 100, 1),
+                "Acoustic Model Engine": "Google Perch 2.0",
+            })
 
     return pd.DataFrame(detections, columns=[
         "Segment ID", "Start Time (s)", "End Time (s)", "Timestamp",
