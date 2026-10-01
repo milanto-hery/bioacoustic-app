@@ -5,5 +5,5 @@ numpy
 pandas
 plotly
 soundfile
-tensorflow-cpu
-perch-hoplite
+resampy
+scipy
