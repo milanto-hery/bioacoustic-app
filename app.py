@@ -8,11 +8,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import io
 import soundfile as sf
-import datetime
-import csv
-import os
-import tempfile
-from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & STYLING
@@ -70,9 +65,7 @@ st.markdown("""
 # CORE AUDIO & AI INFERENCE PIPELINE
 # -----------------------------------------------------------------------------
 
-PERCH_MODEL_HANDLE = "google/bird-vocalization-classifier/tensorFlow2/perch_v2/2"
 PERCH_SAMPLE_RATE = 32000
-PERCH_WINDOW_SECONDS = 5
 
 @st.cache_data
 def load_audio_fast(file_bytes):
@@ -109,135 +102,66 @@ def calculate_audio_telemetry(y, sr):
     }
 
 @st.cache_resource
-def load_birdnet_analyzer():
+def load_perch_model_and_taxonomy():
     try:
-        from birdnetlib.analyzer import Analyzer
+        from perch_hoplite.taxonomy import namespace_db
+        from perch_hoplite.zoo.taxonomy_model_tf import TaxonomyModelTF
     except ImportError as error:
         raise RuntimeError(
-            "BirdNET is not installed in the active Python environment. "
-            "Install this project's requirements.txt before running inference."
+            "Google Perch requires perch-hoplite with its TensorFlow extra. "
+            "Install the project's requirements.txt in the same environment as Streamlit."
         ) from error
 
-    return Analyzer()
+    model = TaxonomyModelTF.load_v2_version(tfhub_version=2)
+    class_list = model.class_list.get("label")
+    if class_list is None or not class_list.classes:
+        raise RuntimeError("The Perch model did not provide its ordered species labels.")
+
+    taxonomy = namespace_db.load_db()
+    scientific_names = {
+        species_code: scientific_name
+        for scientific_name, species_code in taxonomy.mappings[
+            "clements_to_species"
+        ].mapped_pairs.items()
+    }
+    return model, class_list.classes, scientific_names
 
 
-def run_birdnet_inference(audio_data, sr, confidence_threshold, region=None):
-    try:
-        from birdnetlib import Recording
-    except ImportError as error:
-        raise RuntimeError(
-            "BirdNET is not installed in the active Python environment. "
-            "Install this project's requirements.txt before running inference."
-        ) from error
+def run_perch_inference(audio_data, sr, score_threshold):
+    model, labels, scientific_names = load_perch_model_and_taxonomy()
+    audio_32k = librosa.resample(
+        np.asarray(audio_data, dtype=np.float32), orig_sr=sr, target_sr=PERCH_SAMPLE_RATE
+    )
+    outputs = model.embed(audio_32k)
+    logits = outputs.logits.get("label") if outputs.logits else None
+    if logits is None:
+        raise RuntimeError("Perch did not return species classification scores.")
 
-    analyzer = load_birdnet_analyzer()
+    scores = np.asarray(logits).reshape(-1, len(labels))
+    window_size_seconds = float(model.window_size_s)
+    hop_size_seconds = float(model.hop_size_s)
     detections = []
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        audio_path = os.path.join(temp_dir, "uploaded_audio.wav")
-        sf.write(audio_path, np.asarray(audio_data, dtype=np.float32), sr)
-        recording_options = {
-            "date": datetime.date.today().isoformat(),
-            "min_conf": confidence_threshold,
-        }
-        if region is not None:
-            recording_options.update({"lat": region[0], "lon": region[1]})
-
-        recording = Recording(analyzer, audio_path, **recording_options)
-        recording.analyze()
-
-        for index, result in enumerate(recording.detections, start=1):
-            start_time = float(result.get("start_time", 0.0))
-            end_time = float(result.get("end_time", start_time))
-            common_name = result.get("common_name") or result.get("label") or result.get("scientific_name") or "Unknown"
-            scientific_name = result.get("scientific_name") or ""
+    for frame_index, frame_scores in enumerate(scores):
+        probabilities = 1.0 / (1.0 + np.exp(-np.clip(frame_scores, -80, 80)))
+        start_time = frame_index * hop_size_seconds
+        end_time = start_time + window_size_seconds
+        for class_index in np.flatnonzero(probabilities >= score_threshold):
+            label = labels[class_index]
             detections.append({
-                "Segment ID": index,
+                "Segment ID": frame_index + 1,
                 "Start Time (s)": round(start_time, 2),
                 "End Time (s)": round(end_time, 2),
                 "Timestamp": f"{int(start_time // 60):02d}:{int(start_time % 60):02d} - {int(end_time // 60):02d}:{int(end_time % 60):02d}",
-                "Species": common_name,
-                "Scientific Name": scientific_name,
-                "Model Score (%)": round(float(result.get("confidence", 0.0)) * 100, 1),
-                "Acoustic Model Engine": "BirdNET",
+                "Species": scientific_names.get(label, label),
+                "Model Label": label,
+                "Model Score (%)": round(float(probabilities[class_index]) * 100, 1),
+                "Acoustic Model Engine": "Google Perch 2.0",
             })
 
     return pd.DataFrame(detections, columns=[
         "Segment ID", "Start Time (s)", "End Time (s)", "Timestamp",
-        "Species", "Scientific Name", "Model Score (%)", "Acoustic Model Engine",
-    ])
-
-
-@st.cache_resource
-def load_perch_model_and_labels():
-    try:
-        import kagglehub
-        import tensorflow as tf
-    except ImportError as error:
-        raise RuntimeError(
-            "Google Perch requires kagglehub and tensorflow-cpu. "
-            "Install the project's requirements.txt in the same environment as Streamlit."
-        ) from error
-
-    model_path = Path(kagglehub.model_download(PERCH_MODEL_HANDLE))
-    model = tf.saved_model.load(str(model_path))
-    labels_path = model_path / "assets" / "labels.csv"
-    if not labels_path.is_file():
-        raise RuntimeError(f"Perch model labels were not found at {labels_path}.")
-
-    with labels_path.open(newline="", encoding="utf-8") as labels_file:
-        rows = list(csv.reader(labels_file))
-    labels = [row[0].strip() for row in rows[1:] if row and row[0].strip()]
-    if not labels:
-        raise RuntimeError("The Perch model's labels.csv file did not contain any species labels.")
-
-    return model, labels
-
-
-def run_perch_inference(audio_data, sr, score_threshold):
-    model, labels = load_perch_model_and_labels()
-    audio_32k = librosa.resample(
-        np.asarray(audio_data, dtype=np.float32), orig_sr=sr, target_sr=PERCH_SAMPLE_RATE
-    )
-    window_size = PERCH_SAMPLE_RATE * PERCH_WINDOW_SECONDS
-    total_duration = len(audio_32k) / PERCH_SAMPLE_RATE
-    detections = []
-
-    for index, start_sample in enumerate(range(0, len(audio_32k), window_size), start=1):
-        chunk = audio_32k[start_sample:start_sample + window_size]
-        if len(chunk) == 0:
-            continue
-        if len(chunk) < window_size:
-            chunk = np.pad(chunk, (0, window_size - len(chunk)))
-
-        logits, _ = model.infer_tf(chunk[np.newaxis, :])
-        scores = np.asarray(logits).reshape(-1)
-        if len(scores) != len(labels):
-            raise RuntimeError(
-                f"Perch returned {len(scores)} class scores, but its label asset contains {len(labels)} labels."
-            )
-
-        top_index = int(np.argmax(scores))
-        model_score = float(1.0 / (1.0 + np.exp(-np.clip(scores[top_index], -80, 80))))
-        if model_score < score_threshold:
-            continue
-
-        start_time = start_sample / PERCH_SAMPLE_RATE
-        end_time = min(start_time + PERCH_WINDOW_SECONDS, total_duration)
-        detections.append({
-            "Segment ID": index,
-            "Start Time (s)": round(start_time, 2),
-            "End Time (s)": round(end_time, 2),
-            "Timestamp": f"{int(start_time // 60):02d}:{int(start_time % 60):02d} - {int(end_time // 60):02d}:{int(end_time % 60):02d}",
-            "Species": labels[top_index],
-            "Scientific Name": "",
-            "Model Score (%)": round(model_score * 100, 1),
-            "Acoustic Model Engine": "Google Perch 2.0",
-        })
-
-    return pd.DataFrame(detections, columns=[
-        "Segment ID", "Start Time (s)", "End Time (s)", "Timestamp",
-        "Species", "Scientific Name", "Model Score (%)", "Acoustic Model Engine",
+        "Species", "Model Label", "Model Score (%)", "Acoustic Model Engine",
     ])
 
 # -----------------------------------------------------------------------------
@@ -249,8 +173,8 @@ st.sidebar.caption("Enterprise Bioacoustics Analysis & Avian Monitoring")
 st.sidebar.divider()
 
 st.sidebar.subheader("🤖 Species Classifier")
-model_choice = st.sidebar.selectbox("Select model", ["Google Perch 2.0", "BirdNET"])
-st.sidebar.caption("Species labels are read from the selected model's own label set.")
+st.sidebar.markdown("**Google Perch 2.0**")
+st.sidebar.caption("Species detections are generated by Perch. Model labels are mapped to scientific names where available.")
 
 # Audio Upload
 st.sidebar.subheader("📁 Audio Source Ingestion")
@@ -262,17 +186,8 @@ uploaded_file = st.sidebar.file_uploader(
 # Detection Hyperparameters
 st.sidebar.subheader("⚙️ Detection Hyperparameters")
 conf_threshold = st.sidebar.slider("Minimum Model Score (%)", min_value=15, max_value=95, value=35, step=5) / 100.0
-if model_choice == "Google Perch 2.0":
-    st.sidebar.caption("Perch scores are uncalibrated ranking scores, not probabilities.")
+st.sidebar.caption("Perch scores are uncalibrated ranking scores, not probabilities.")
 spectrogram_cmap = st.sidebar.selectbox("Spectrogram Colormap", ["magma", "viridis", "inferno", "plasma", "cividis"], index=0)
-
-use_geo_filter = model_choice == "BirdNET" and st.sidebar.checkbox("Use regional BirdNET filter", value=False)
-region = None
-if use_geo_filter:
-    region_col1, region_col2 = st.sidebar.columns(2)
-    latitude = region_col1.number_input("Latitude", min_value=-90.0, max_value=90.0, value=-18.9, step=0.1)
-    longitude = region_col2.number_input("Longitude", min_value=-180.0, max_value=180.0, value=47.5, step=0.1)
-    region = (latitude, longitude)
 
 # -----------------------------------------------------------------------------
 # MAIN APPLICATION WORKSPACE
@@ -290,15 +205,10 @@ if uploaded_file is not None:
         telemetry = calculate_audio_telemetry(y, sr)
         
     try:
-        with st.spinner(f"🧠 Running {model_choice} classification..."):
-            if model_choice == "Google Perch 2.0":
-                df_detections = run_perch_inference(y, sr, score_threshold=conf_threshold)
-            else:
-                df_detections = run_birdnet_inference(
-                    y, sr, confidence_threshold=conf_threshold, region=region
-                )
+        with st.spinner("🧠 Running Google Perch 2.0 classification..."):
+            df_detections = run_perch_inference(y, sr, score_threshold=conf_threshold)
     except Exception as error:
-        st.error(f"BirdNET inference failed: {error}")
+        st.error(f"Google Perch inference failed: {error}")
         st.stop()
         
     # -------------------------------------------------------------------------
@@ -357,7 +267,7 @@ if uploaded_file is not None:
             # Display Data Table
             st.dataframe(
                 filtered_df[[
-                    "Timestamp", "Species", "Scientific Name",
+                    "Timestamp", "Species", "Model Label",
                     "Model Score (%)", "Acoustic Model Engine"
                 ]],
                 use_container_width=True,
@@ -406,7 +316,7 @@ if uploaded_file is not None:
                     y="Species",
                     size="Model Score (%)",
                     color="Species",
-                    hover_data=["Scientific Name", "Model Score (%)"],
+                    hover_data=["Model Label", "Model Score (%)"],
                     labels={"Start Time (s)": "Time (Seconds)", "Species": "Identified Species"}
                 )
                 fig_scatter.update_layout(margin=dict(t=20, b=20, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
@@ -499,11 +409,11 @@ if uploaded_file is not None:
         st.subheader("📚 Bioacoustics Models & Avian Taxonomy Architecture")
         
         st.markdown("""
-        ### Google Perch 2.0 and BirdNET
-        Choose the model in the sidebar. Each inference path uses the selected model's own output labels,
-        not a hard-coded species list or the uploaded filename. Perch uses 5-second mono audio windows at
-        32 kHz and returns uncalibrated species scores; BirdNET provides confidence scores and an optional
-        geographic filter.
+        ### Google Perch 2.0
+        This dashboard uses Perch for all species predictions. It reads the ordered class labels bundled
+        with the model and maps eBird labels to scientific names using Perch-Hoplite's taxonomy database.
+        Results show the scientific name and original model label. Perch's ranking scores are uncalibrated
+        and should not be interpreted as probabilities.
         """)
 
 else:
