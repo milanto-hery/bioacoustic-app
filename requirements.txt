@@ -6,6 +6,9 @@ pandas
 plotly
 soundfile
 birdnetlib
-tensorflow-cpu
+kagglehub>=0.3,<1
+tensorflow-cpu>=2.15,<2.21
+transformers
+torch
 resampy
 scipy
