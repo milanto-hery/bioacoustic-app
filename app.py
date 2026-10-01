@@ -44,7 +44,7 @@ st.markdown("""
         background-color: #FAFAFA;
     }
 </style>
-""", unsafe_allow_allow_html=True)
+""", unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS: AUDIO PROCESSING & MOCK AI INFERENCE
