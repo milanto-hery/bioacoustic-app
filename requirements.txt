@@ -6,7 +6,6 @@ pandas
 plotly
 soundfile
 birdnetlib
-transformers
-torch
+tflite-runtime
 resampy
 scipy
