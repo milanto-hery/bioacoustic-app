@@ -186,18 +186,22 @@ def run_perch_inference(audio_data, sr, score_threshold):
         probabilities = 1.0 / (1.0 + np.exp(-np.clip(frame_scores, -80, 80)))
         start_time = frame_index * hop_size_seconds
         end_time = start_time + window_size_seconds
-        for class_index in np.flatnonzero(probabilities >= score_threshold):
-            label = labels[class_index]
-            detections.append({
-                "Segment ID": frame_index + 1,
-                "Start Time (s)": round(start_time, 2),
-                "End Time (s)": round(end_time, 2),
-                "Timestamp": f"{int(start_time // 60):02d}:{int(start_time % 60):02d} - {int(end_time // 60):02d}:{int(end_time % 60):02d}",
-                "Species": scientific_names.get(label, label),
-                "Model Label": label,
-                "Model Score (%)": round(float(probabilities[class_index]) * 100, 1),
-                "Acoustic Model Engine": "Google Perch 2.0",
-            })
+        class_index = int(np.argmax(probabilities))
+        model_score = float(probabilities[class_index])
+        if model_score < score_threshold:
+            continue
+
+        label = labels[class_index]
+        detections.append({
+            "Segment ID": frame_index + 1,
+            "Start Time (s)": round(start_time, 2),
+            "End Time (s)": round(end_time, 2),
+            "Timestamp": f"{int(start_time // 60):02d}:{int(start_time % 60):02d} - {int(end_time // 60):02d}:{int(end_time % 60):02d}",
+            "Species": scientific_names.get(label, label),
+            "Model Label": label,
+            "Model Score (%)": round(model_score * 100, 1),
+            "Acoustic Model Engine": "Google Perch 2.0",
+        })
 
     return pd.DataFrame(detections, columns=[
         "Segment ID", "Start Time (s)", "End Time (s)", "Timestamp",
@@ -225,8 +229,8 @@ uploaded_file = st.sidebar.file_uploader(
 
 # Detection Hyperparameters
 st.sidebar.subheader("⚙️ Detection Hyperparameters")
-conf_threshold = st.sidebar.slider("Minimum Model Score (%)", min_value=15, max_value=95, value=35, step=5) / 100.0
-st.sidebar.caption("Perch scores are uncalibrated ranking scores, not probabilities.")
+conf_threshold = st.sidebar.slider("Minimum Model Score (%)", min_value=15, max_value=95, value=50, step=5) / 100.0
+st.sidebar.caption("One top-ranked species is reported per 5-second window when it meets this uncalibrated score cutoff.")
 spectrogram_cmap = st.sidebar.selectbox("Spectrogram Colormap", ["magma", "viridis", "inferno", "plasma", "cividis"], index=0)
 
 # -----------------------------------------------------------------------------
