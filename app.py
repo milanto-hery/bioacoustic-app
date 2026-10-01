@@ -105,14 +105,15 @@ def calculate_audio_telemetry(y, sr):
 def load_perch_model_and_taxonomy():
     try:
         from perch_hoplite.taxonomy import namespace_db
-        from perch_hoplite.zoo.taxonomy_model_tf import TaxonomyModelTF
+        from perch_hoplite.zoo import model_configs
     except ImportError as error:
         raise RuntimeError(
             "Google Perch requires perch-hoplite with its TensorFlow extra. "
             "Install the project's requirements.txt in the same environment as Streamlit."
         ) from error
 
-    model = TaxonomyModelTF.load_v2_version(tfhub_version=2)
+    perch_config = model_configs.get_preset_model_config("perch_v2")
+    model = perch_config.load_model()
     class_lists = model.class_list
     if not class_lists:
         raise RuntimeError(
