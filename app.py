@@ -11,7 +11,7 @@ import json
 import os
 import gc
 
-# Force TensorFlow / CPU memory allocation limits if available
+# Force TensorFlow / CPU memory allocation limits
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 try:
     import tensorflow as tf
@@ -20,21 +20,7 @@ try:
 except Exception:
     pass
 
-# Try importing perch_hoplite or fallback transformers pipeline
-PERCH_HOPLITE_AVAILABLE = False
-try:
-    from perch_hoplite.taxonomy import taxonomy_model
-    PERCH_HOPLITE_AVAILABLE = True
-except ImportError:
-    PERCH_HOPLITE_AVAILABLE = False
-
-HUGGINGFACE_AVAILABLE = False
-try:
-    import torch
-    from transformers import pipeline
-    HUGGINGFACE_AVAILABLE = True
-except ImportError:
-    HUGGINGFACE_AVAILABLE = False
+PERCH_SAMPLE_RATE = 32000
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & STYLING
@@ -126,34 +112,71 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# CACHED MODEL & AUDIO HELPERS
+# GOOGLE PERCH MODEL & TAXONOMY LOADER (EXACT MATCH TO APP-.TXT)
 # -----------------------------------------------------------------------------
 
-@st.cache_resource(show_spinner=False)
-def load_perch_tf_model():
-    """Loads Google Perch TF model once into memory."""
-    if not PERCH_HOPLITE_AVAILABLE:
-        return None
-    try:
-        model = taxonomy_model.TaxonomyModelTF.from_preset("perch_ebird2021")
-        return model
-    except Exception:
-        return None
+def normalize_perch_frames(framed_audio, target_peak):
+    if target_peak is None:
+        return framed_audio
+    centered_audio = framed_audio.copy()
+    centered_audio -= np.mean(centered_audio, axis=-1, keepdims=True)
+    peak_norm = np.max(np.abs(centered_audio), axis=-1, keepdims=True)
+    normalized_audio = np.zeros_like(centered_audio)
+    np.divide(
+        centered_audio,
+        peak_norm,
+        out=normalized_audio,
+        where=peak_norm > 0.0,
+    )
+    return normalized_audio * target_peak
 
 @st.cache_resource(show_spinner=False)
-def load_hf_classifier():
-    """Loads HuggingFace bioacoustics classifier fallback."""
-    if not HUGGINGFACE_AVAILABLE:
-        return None
+def load_perch_model_and_taxonomy():
+    """
+    Loads Google Perch model and eBird taxonomy database exactly as defined in app-.txt.
+    """
     try:
-        return pipeline("audio-classification", model="MIT/ast-finetuned-audioset-10-10-0.4593", top_k=5)
+        from perch_hoplite.taxonomy import namespace_db
+        from perch_hoplite.zoo import model_configs
+    except ImportError as error:
+        return None, None, {}, {}
+
+    try:
+        perch_config = model_configs.get_preset_model_config("perch_v2")
+        model = perch_config.load_model()
+        model.normalize_audio = normalize_perch_frames
+        class_lists = model.class_list
+        if not class_lists:
+            return model, None, {}, {}
+
+        taxonomy = namespace_db.load_db()
+        scientific_names_by_namespace = {}
+        all_scientific_names = {}
+        for mapping_name in (
+            "ebird2021_clements_to_species",
+            "ebird2022_clements_to_species",
+        ):
+            if mapping_name in taxonomy.mappings:
+                mapping = taxonomy.mappings[mapping_name]
+                names_by_code = {
+                    species_code: scientific_name
+                    for scientific_name, species_code in mapping.mapped_pairs.items()
+                }
+                scientific_names_by_namespace[mapping.target_namespace] = names_by_code
+                all_scientific_names.update(names_by_code)
+
+        return model, class_lists, scientific_names_by_namespace, all_scientific_names
     except Exception:
-        return None
+        return None, None, {}, {}
+
+# -----------------------------------------------------------------------------
+# AUDIO & TELEMETRY HELPERS
+# -----------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
 def load_audio_with_original_sr(file_bytes):
     """
-    Loads audio to extract original sample rate, duration, and resampled 32kHz array for Perch model.
+    Loads audio using native sample rate to preserve original metadata.
     """
     try:
         info = sf.info(io.BytesIO(file_bytes))
@@ -161,15 +184,15 @@ def load_audio_with_original_sr(file_bytes):
     except Exception:
         orig_sr = 44100
         
-    y_32k, sr_32k = librosa.load(io.BytesIO(file_bytes), sr=32000)
-    if y_32k.dtype != np.float32:
-        y_32k = y_32k.astype(np.float32)
+    y, sr = librosa.load(io.BytesIO(file_bytes), sr=None)
+    if y.dtype != np.float32:
+        y = y.astype(np.float32)
         
-    duration = float(len(y_32k) / 32000.0)
-    return y_32k, orig_sr, duration
+    duration = float(librosa.get_duration(y=y, sr=sr))
+    return y, sr, orig_sr, duration
 
 def calculate_audio_telemetry(y, orig_sr, duration):
-    """Computes audio telemetry parameters."""
+    """Computes audio quality and ecoacoustic metrics."""
     signal_power = np.mean(y**2) + 1e-10
     noise_power = np.percentile(y**2, 10) + 1e-10
     snr_db = float(10 * np.log10(signal_power / noise_power))
@@ -180,7 +203,7 @@ def calculate_audio_telemetry(y, orig_sr, duration):
         "sample_rate": orig_sr
     }
 
-def compute_ecoacoustic_indices(y, sr=32000):
+def compute_ecoacoustic_indices(y, sr):
     """
     Computes real dynamic ecoacoustic soundscape indices from audio signal:
     - ACI (Acoustic Complexity Index)
@@ -190,16 +213,13 @@ def compute_ecoacoustic_indices(y, sr=32000):
     if len(y) == 0:
         return {"aci": 0.0, "bi": 0.0, "ndsi": 0.0, "status": "No Signal"}
     
-    # Compute Power Spectrogram
     S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512)) ** 2
     freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
     
-    # 1. Acoustic Complexity Index (ACI)
     diff_S = np.abs(np.diff(S, axis=1))
     sum_S = np.sum(S[:, :-1], axis=1) + 1e-10
     aci_val = float(np.sum(np.sum(diff_S, axis=1) / sum_S))
     
-    # 2. Bioacoustic Index (BI) - Energy in 2000Hz - 8000Hz band
     bio_mask = (freqs >= 2000) & (freqs <= 8000)
     if np.any(bio_mask):
         mean_spec_dB = 10 * np.log10(np.mean(S[bio_mask, :], axis=1) + 1e-10)
@@ -208,7 +228,6 @@ def compute_ecoacoustic_indices(y, sr=32000):
     else:
         bi_val = 0.0
         
-    # 3. Normalized Difference Soundscape Index (NDSI)
     anthro_mask = (freqs >= 1000) & (freqs < 2000)
     biophony_power = np.sum(S[bio_mask, :]) + 1e-10
     anthrophony_power = np.sum(S[anthro_mask, :]) + 1e-10
@@ -223,100 +242,115 @@ def compute_ecoacoustic_indices(y, sr=32000):
         "status": status
     }
 
-def run_pure_model_inference(y, sr=32000, segment_dur=5.0, confidence_threshold=0.50):
-    """
-    Executes species detection purely using neural network model weights.
-    Strictly avoids hardcoded species names!
-    """
-    detections = []
-    perch_model = load_perch_tf_model()
-    
-    if perch_model is not None:
-        target_sr = 32000
-        step_samples = int(segment_dur * target_sr)
-        total_len = len(y)
-        num_segments = int(np.ceil(total_len / step_samples))
-        
-        for i in range(num_segments):
-            start_sample = i * step_samples
-            end_sample = min(start_sample + step_samples, total_len)
-            chunk = y[start_sample:end_sample]
-            
-            if len(chunk) < target_sr:
-                continue
-            if len(chunk) < step_samples:
-                chunk = np.pad(chunk, (0, step_samples - len(chunk)))
+# -----------------------------------------------------------------------------
+# GOOGLE PERCH INFERENCE ENGINE (EXACT PIPELINE FROM APP-.TXT)
+# -----------------------------------------------------------------------------
 
-            try:
-                audio_tensor = tf.convert_to_tensor(chunk[np.newaxis, :], dtype=tf.float32)
-                outputs = perch_model(audio_tensor)
-                logits = outputs.logits.numpy() if hasattr(outputs, 'logits') else outputs.numpy()
-                probabilities = tf.nn.sigmoid(logits).numpy()
-                
-                del audio_tensor, outputs, logits
-                top_indices = np.where(probabilities >= confidence_threshold)
-                
-                start_t = i * segment_dur
-                end_t = min(start_t + segment_dur, total_len / target_sr)
-                
-                for idx in top_indices:
-                    score = float(probabilities[idx])
-                    # Pure label from Perch eBird2021 model taxonomy
-                    raw_label = perch_model.labels[idx] if hasattr(perch_model, 'labels') else f"Taxonomy_ID_{idx}"
-                    clean_name = raw_label.replace("_", " ").title()
-                    
-                    detections.append({
-                        "Segment ID": i + 1,
-                        "Start Time (s)": round(start_t, 2),
-                        "End Time (s)": round(end_t, 2),
-                        "Timestamp": f"{int(start_t//60):02d}:{int(start_t%60):02d} - {int(end_t//60):02d}:{int(end_t%60):02d}",
-                        "Detected Species": clean_name,
-                        "Confidence (%)": round(score * 100, 1)
-                    })
-            except Exception:
+def run_perch_inference(audio_data, sr, score_threshold=0.50):
+    """
+    Runs Google Perch 2.0 batch inference directly matching app-.txt architecture.
+    """
+    model, class_lists, scientific_names_by_namespace, all_scientific_names = load_perch_model_and_taxonomy()
+    
+    if model is None or not class_lists:
+        st.warning("⚠️ Google Perch (`perch-hoplite`) model weights are loading or unavailable in this environment.")
+        return pd.DataFrame()
+
+    audio_32k = librosa.resample(
+        np.asarray(audio_data, dtype=np.float32),
+        orig_sr=sr,
+        target_sr=PERCH_SAMPLE_RATE
+    )
+    
+    window_size_seconds = float(getattr(model, "window_size_s", 5.0))
+    hop_size_seconds = float(getattr(model, "hop_size_s", 5.0))
+    window_samples = int(window_size_seconds * PERCH_SAMPLE_RATE)
+    hop_samples = int(hop_size_seconds * PERCH_SAMPLE_RATE)
+    
+    if window_samples <= 0 or hop_samples <= 0:
+        window_samples = 5 * PERCH_SAMPLE_RATE
+        hop_samples = 5 * PERCH_SAMPLE_RATE
+
+    frame_starts = list(range(0, len(audio_32k), hop_samples))
+    if not frame_starts:
+        frame_starts = [0]
+
+    batch_size = 8
+    logits_key = None
+    labels = None
+    scientific_names = all_scientific_names
+    detections = []
+
+    for batch_start in range(0, len(frame_starts), batch_size):
+        batch_frame_starts = frame_starts[batch_start:batch_start + batch_size]
+        audio_batch = []
+        for start_sample in batch_frame_starts:
+            frame = audio_32k[start_sample:start_sample + window_samples]
+            if len(frame) < window_samples:
+                if start_sample == 0:
+                    frame = librosa.util.pad_center(frame, size=window_samples)
+                else:
+                    frame = np.pad(frame, (0, window_samples - len(frame)))
+            audio_batch.append(frame)
+
+        try:
+            outputs = model.batch_embed(np.stack(audio_batch))
+            if not outputs.logits:
                 continue
-            finally:
-                del chunk
-                gc.collect()
+
+            if logits_key is None:
+                logits_key = "label" if "label" in outputs.logits else None
+                if logits_key is None and len(outputs.logits) == 1:
+                    logits_key = next(iter(outputs.logits))
+                if logits_key is None:
+                    continue
+
+                class_count = np.asarray(outputs.logits[logits_key]).shape[-1]
+                matching_class_lists = [
+                    cl for cl in class_lists.values()
+                    if len(cl.classes) == class_count
+                ]
+                if matching_class_lists:
+                    class_list = matching_class_lists[0]
+                    labels = class_list.classes
+                    scientific_names = scientific_names_by_namespace.get(
+                        class_list.namespace, all_scientific_names
+                    )
+                else:
+                    labels = [f"Class_{k}" for k in range(class_count)]
+
+            batch_logits = np.asarray(outputs.logits[logits_key])
+            batch_scores = batch_logits.reshape(len(batch_frame_starts), -1, len(labels))
+
+            for batch_index, frame_scores in enumerate(batch_scores[:, 0, :]):
+                probabilities = 1.0 / (1.0 + np.exp(-np.clip(frame_scores, -80, 80)))
+                class_index = int(np.argmax(probabilities))
+                model_score = float(probabilities[class_index])
+                if model_score < score_threshold:
+                    continue
+
+                start_time = batch_frame_starts[batch_index] / PERCH_SAMPLE_RATE
+                end_time = min(
+                    start_time + window_size_seconds,
+                    len(audio_32k) / PERCH_SAMPLE_RATE,
+                )
+                label = labels[class_index]
+                species_name = scientific_names.get(label, label).replace("_", " ").title()
                 
-        return pd.DataFrame(detections)
-        
-    # Fallback to HuggingFace Audio Pipeline if installed (No hardcoded species!)
-    hf_classifier = load_hf_classifier()
-    if hf_classifier is not None:
-        total_duration = float(len(y) / sr)
-        step = segment_dur
-        num_segments = int(np.ceil(total_duration / step))
-        
-        for i in range(num_segments):
-            start_t = i * step
-            end_t = min(start_t + segment_dur, total_duration)
-            start_s = int(start_t * sr)
-            end_s = int(end_t * sr)
-            chunk = y[start_s:end_s]
-            if len(chunk) < sr:
-                continue
-                
-            audio_input = {"raw": chunk, "sampling_rate": sr}
-            try:
-                results = hf_classifier(audio_input)
-                if results:
-                    for pred in results:
-                        score = float(pred.get("score", 0.0))
-                        if score >= confidence_threshold:
-                            label = pred.get("label", "Unclassified Audio").replace("_", " ").title()
-                            detections.append({
-                                "Segment ID": i + 1,
-                                "Start Time (s)": round(start_t, 2),
-                                "End Time (s)": round(end_t, 2),
-                                "Timestamp": f"{int(start_t//60):02d}:{int(start_t%60):02d} - {int(end_t//60):02d}:{int(end_t%60):02d}",
-                                "Detected Species": label,
-                                "Confidence (%)": round(score * 100, 1)
-                            })
-            except Exception:
-                continue
-                
-        return pd.DataFrame(detections)
+                detections.append({
+                    "Segment ID": batch_start + batch_index + 1,
+                    "Start Time (s)": round(start_time, 2),
+                    "End Time (s)": round(end_time, 2),
+                    "Timestamp": f"{int(start_time // 60):02d}:{int(start_time % 60):02d} - {int(end_time // 60):02d}:{int(end_time % 60):02d}",
+                    "Detected Species": species_name,
+                    "Model Label": label,
+                    "Confidence (%)": round(model_score * 100, 1),
+                    "Acoustic Model Engine": "Google Perch 2.0"
+                })
+        except Exception:
+            continue
+        finally:
+            gc.collect()
 
     return pd.DataFrame(detections)
 
@@ -337,7 +371,7 @@ uploaded_file = st.sidebar.file_uploader(
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ Detection Hyperparameters")
 conf_threshold = st.sidebar.slider("Minimum Confidence Threshold (%)", min_value=15, max_value=95, value=50, step=5) / 100.0
-segment_window = st.sidebar.select_slider("Segment Window (Seconds)", options=[2.0, 3.0, 5.0, 10.0], value=5.0)
+st.sidebar.caption("One top-ranked species is reported per 5-second window when it meets this score cutoff.")
 spectrogram_cmap = st.sidebar.selectbox("Spectrogram Colormap", ["magma", "viridis", "inferno", "plasma", "cividis"], index=0)
 
 st.sidebar.divider()
@@ -358,7 +392,7 @@ st.markdown('<div class="sub-header">Automated wildlife sound detection, acousti
 # AUDIO INGESTION & DATA PROCESSING
 # -----------------------------------------------------------------------------
 
-y, orig_sr, duration = None, None, None
+y, sr, orig_sr, duration = None, None, None, None
 telemetry = {"duration": None, "snr_db": None, "sample_rate": None}
 indices = {"aci": None, "bi": None, "ndsi": None, "status": "Awaiting Signal"}
 df_detections = pd.DataFrame()
@@ -366,10 +400,12 @@ audio_bytes = None
 
 if uploaded_file is not None:
     audio_bytes = uploaded_file.read()
-    y, orig_sr, duration = load_audio_with_original_sr(audio_bytes)
+    y, sr, orig_sr, duration = load_audio_with_original_sr(audio_bytes)
     telemetry = calculate_audio_telemetry(y, orig_sr, duration)
-    indices = compute_ecoacoustic_indices(y, sr=32000)
-    df_detections = run_pure_model_inference(y, sr=32000, segment_dur=segment_window, confidence_threshold=conf_threshold)
+    indices = compute_ecoacoustic_indices(y, sr)
+    
+    with st.spinner("🧠 Running Google Perch 2.0 neural network inference..."):
+        df_detections = run_perch_inference(y, sr, score_threshold=conf_threshold)
 
 # -----------------------------------------------------------------------------
 # ALWAYS-VISIBLE KPI METRICS BAR
@@ -465,7 +501,7 @@ with tab1:
             filtered_df = filtered_df.sort_values(by="Confidence (%)", ascending=False)
 
         st.dataframe(
-            filtered_df[["Timestamp", "Detected Species", "Confidence (%)", "Start Time (s)", "End Time (s)"]],
+            filtered_df[["Timestamp", "Detected Species", "Model Label", "Confidence (%)", "Start Time (s)", "End Time (s)"]],
             width="stretch",
             hide_index=True
         )
@@ -530,16 +566,14 @@ with tab2:
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 5.5), sharex=True)
         
-        # Waveform
-        librosa.display.waveshow(y, sr=32000, ax=ax1, color="#0284C7")
+        librosa.display.waveshow(y, sr=sr, ax=ax1, color="#0284C7")
         ax1.set_title("Time-Domain Waveform (Amplitude)", fontsize=10.5, fontweight="600", color="#0F172A")
         ax1.set_ylabel("Amplitude", fontsize=9)
         ax1.grid(True, linestyle="--", alpha=0.3)
         
-        # Spectrogram
-        S = librosa.feature.melspectrogram(y=y, sr=32000, n_mels=128, fmax=12000)
+        S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, fmax=min(12000, sr//2))
         S_dB = librosa.power_to_db(S, ref=np.max)
-        img = librosa.display.specshow(S_dB, sr=32000, x_axis='time', y_axis='mel', ax=ax2, cmap=spectrogram_cmap, fmax=12000)
+        img = librosa.display.specshow(S_dB, sr=sr, x_axis='time', y_axis='mel', ax=ax2, cmap=spectrogram_cmap, fmax=min(12000, sr//2))
         ax2.set_title(f"Mel Spectrogram ({spectrogram_cmap.title()} Palette)", fontsize=10.5, fontweight="600", color="#0F172A")
         ax2.set_ylabel("Frequency (Hz)", fontsize=9)
         fig.colorbar(img, ax=ax2, format='%+2.0f dB')
@@ -604,7 +638,7 @@ with tab4:
     st.markdown("""
     This workstation integrates multi-layered bioacoustics classification pipelines tailored for wildlife conservation:
     
-    * **Foundation Neural Models:** Leverages Google Perch 2.0 (`perch_ebird2021`) and BirdNET deep neural network architectures trained on global avifauna datasets.
+    * **Foundation Neural Models:** Leverages Google Perch 2.0 (`perch_v2` preset) and eBird Clements taxonomy database (`ebird2021` / `ebird2022`).
     * **Localized Domain Adaptation:** Incorporates transfer learning and fine-tuning specifically for endemic and rare Malagasy species (e.g., *Foudia madagascariensis*, *Copsychus albospecularis*).
     * **Uncertainty Quantification & Calibration:** Prevents false positives in noisy tropical forest environments by calibrating prediction logits with confidence thresholds.
     * **Ecoacoustic Health Diagnostics:** Automatically computes ACI, BI, and NDSI soundscape indices directly from signal spectral frames to evaluate ecosystem biophony versus human noise.
