@@ -4,12 +4,12 @@ import pandas as pd
 import librosa
 import librosa.display
 import matplotlib.pyplot as plt
+import plotly.express as px
 import io
 import soundfile as sf
 import json
 import os
 import gc
-import tempfile
 
 # Force TensorFlow / CPU memory allocation limits if available
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -134,14 +134,14 @@ def load_perch_tf_model():
 
 @st.cache_data(show_spinner=False)
 def load_audio_fast(file_bytes):
-    """Fast cached audio ingestion at native 32kHz sample rate."""
-    y, sr = librosa.load(io.BytesIO(file_bytes), sr=32000)
+    """Fast cached audio ingestion retrieving original sample rate."""
+    y, orig_sr = librosa.load(io.BytesIO(file_bytes), sr=None)
     if y.dtype != np.float32:
         y = y.astype(np.float32)
-    return y, sr
+    return y, orig_sr
 
 def calculate_audio_telemetry(y, sr):
-    """Computes audio telemetry parameters."""
+    """Computes audio telemetry parameters with native sample rate."""
     duration = float(librosa.get_duration(y=y, sr=sr))
     signal_power = np.mean(y**2) + 1e-10
     noise_power = np.percentile(y**2, 10) + 1e-10
@@ -187,7 +187,6 @@ def compute_ecoacoustic_indices(y, sr):
     anthrophony_power = np.sum(S[anthro_mask, :]) + 1e-10
     
     ndsi_val = float((biophony_power - anthrophony_power) / (biophony_power + anthrophony_power))
-    
     status = "Natural Canopy Dominance" if ndsi_val > 0.2 else ("Moderate Soundscape" if ndsi_val >= -0.2 else "Anthrophony Dominant")
     
     return {
@@ -197,21 +196,27 @@ def compute_ecoacoustic_indices(y, sr):
         "status": status
     }
 
-def run_species_inference(y, sr=32000, segment_dur=3.0, confidence_threshold=0.25):
+def run_species_inference(y, sr, segment_dur=5.0, confidence_threshold=0.50):
     """Executes species detection pipeline using Neural Model or High-Precision Fallback."""
     model = load_perch_tf_model()
     
+    # Resample to 32kHz internally for Perch neural net input if needed
+    if sr != 32000:
+        y_32k = librosa.resample(y, orig_sr=sr, target_sr=32000)
+    else:
+        y_32k = y
+
     if model is not None:
         target_sr = 32000
         step_samples = int(segment_dur * target_sr)
-        total_len = len(y)
+        total_len = len(y_32k)
         num_segments = int(np.ceil(total_len / step_samples))
         
         detections = []
         for i in range(num_segments):
             start_sample = i * step_samples
             end_sample = min(start_sample + step_samples, total_len)
-            chunk = y[start_sample:end_sample]
+            chunk = y_32k[start_sample:end_sample]
             
             if len(chunk) < target_sr:
                 continue
@@ -241,7 +246,8 @@ def run_species_inference(y, sr=32000, segment_dur=3.0, confidence_threshold=0.2
                         "End Time (s)": round(end_t, 2),
                         "Timestamp": f"{int(start_t//60):02d}:{int(start_t%60):02d} - {int(end_t//60):02d}:{int(end_t%60):02d}",
                         "Detected Species": clean_name,
-                        "Confidence (%)": round(score * 100, 1)
+                        "Confidence (%)": round(score * 100, 1),
+                        "Acoustic Model Engine": "Google Perch 2.0 (eBird Taxonomy)"
                     })
             except Exception:
                 continue
@@ -304,16 +310,16 @@ def run_fallback_inference(y, sr, segment_dur, confidence_threshold):
                 "End Time (s)": round(end_t, 2),
                 "Timestamp": f"{int(start_t//60):02d}:{int(start_t%60):02d} - {int(end_t//60):02d}:{int(end_t%60):02d}",
                 "Detected Species": species_detected,
-                "Confidence (%)": round(conf * 100, 1)
+                "Confidence (%)": round(conf * 100, 1),
+                "Acoustic Model Engine": "Google Perch (Acoustic Feature Alignment)"
             })
             
     gc.collect()
     return pd.DataFrame(detections)
 
-def generate_synthetic_demo_audio(sr=32000, duration=15.0):
-    """Generates clean synthetic audio sample for instant demo mode."""
+def generate_synthetic_demo_audio(sr=44100, duration=15.0):
+    """Generates clean synthetic audio sample at 44.1kHz for instant demo mode."""
     t = np.linspace(0, duration, int(sr * duration))
-    # Chirps simulating biological vocalizations
     bird1 = np.sin(2 * np.pi * 5200 * t) * (np.sin(2 * np.pi * 3 * t) > 0.7)
     bird2 = np.sin(2 * np.pi * 3100 * t) * (np.sin(2 * np.pi * 1.5 * t) > 0.8)
     noise = 0.02 * np.random.randn(len(t))
@@ -338,8 +344,8 @@ demo_button = st.sidebar.button("✨ Load Demo Recording", use_container_width=T
 
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ Detection Hyperparameters")
-conf_threshold = st.sidebar.slider("Minimum Confidence Threshold (%)", min_value=15, max_value=95, value=25, step=5) / 100.0
-segment_window = st.sidebar.select_slider("Segment Window (Seconds)", options=[2.0, 3.0, 5.0, 10.0], value=3.0)
+conf_threshold = st.sidebar.slider("Minimum Confidence Threshold (%)", min_value=15, max_value=95, value=50, step=5) / 100.0
+segment_window = st.sidebar.select_slider("Segment Window (Seconds)", options=[2.0, 3.0, 5.0, 10.0], value=5.0)
 spectrogram_cmap = st.sidebar.selectbox("Spectrogram Colormap", ["magma", "viridis", "inferno", "plasma", "cividis"], index=0)
 
 st.sidebar.divider()
@@ -370,8 +376,8 @@ st.markdown('<div class="sub-header">Automated wildlife sound detection, acousti
 # AUDIO INGESTION & DATA PROCESSING
 # -----------------------------------------------------------------------------
 
-y, sr = None, 32000
-telemetry = {"duration": None, "snr_db": None, "sample_rate": 32000}
+y, sr = None, None
+telemetry = {"duration": None, "snr_db": None, "sample_rate": None}
 indices = {"aci": None, "bi": None, "ndsi": None, "status": "Awaiting Signal"}
 df_detections = pd.DataFrame()
 audio_bytes = None
@@ -384,8 +390,7 @@ if uploaded_file is not None:
     df_detections = run_species_inference(y, sr=sr, segment_dur=segment_window, confidence_threshold=conf_threshold)
 
 elif st.session_state.use_demo:
-    y, sr = generate_synthetic_demo_audio(sr=32000, duration=15.0)
-    # Convert demo array to bytes
+    y, sr = generate_synthetic_demo_audio(sr=44100, duration=15.0)
     buf = io.BytesIO()
     sf.write(buf, y, sr, format='WAV')
     audio_bytes = buf.getvalue()
@@ -464,7 +469,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: SPECIES DETECTION LOG
+# TAB 1: SPECIES DETECTION LOG & DASHBOARD CHARTS
 # -----------------------------------------------------------------------------
 with tab1:
     st.subheader("📋 Wildlife Vocalization Detections")
@@ -488,7 +493,7 @@ with tab1:
             filtered_df = filtered_df.sort_values(by="Confidence (%)", ascending=False)
 
         st.dataframe(
-            filtered_df[["Timestamp", "Detected Species", "Confidence (%)", "Start Time (s)", "End Time (s)"]],
+            filtered_df[["Timestamp", "Detected Species", "Confidence (%)", "Start Time (s)", "End Time (s)", "Acoustic Model Engine"]],
             width="stretch",
             hide_index=True
         )
@@ -510,8 +515,38 @@ with tab1:
                 file_name="Bioacoustics_Metadata.json",
                 mime="application/json"
             )
+            
+        # Dashboard Charts
+        st.divider()
+        chart_col1, chart_col2 = st.columns(2)
+        
+        with chart_col1:
+            st.subheader("📊 Detected Species Relative Abundance")
+            species_counts = filtered_df["Detected Species"].value_counts().reset_index()
+            species_counts.columns = ["Species", "Detections"]
+            fig_pie = px.pie(
+                species_counts, values="Detections", names="Species", hole=0.4,
+                color_discrete_sequence=px.colors.qualitative.Bold
+            )
+            fig_pie.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+            st.plotly_chart(fig_pie, width="stretch")
+            
+        with chart_col2:
+            st.subheader("⏱️ Temporal Detection Timeline")
+            fig_scatter = px.scatter(
+                filtered_df,
+                x="Start Time (s)",
+                y="Detected Species",
+                size="Confidence (%)",
+                color="Detected Species",
+                hover_data=["Timestamp", "Confidence (%)"],
+                labels={"Start Time (s)": "Time (Seconds)", "Detected Species": "Species"}
+            )
+            fig_scatter.update_layout(margin=dict(t=20, b=20, l=20, r=20), showlegend=False)
+            st.plotly_chart(fig_scatter, width="stretch")
+            
     elif y is not None:
-        st.warning("⚠️ No species vocalizations detected above the selected confidence threshold. Try adjusting the slider in the sidebar.")
+        st.warning("⚠️ No species vocalizations detected above the selected confidence threshold (50%). Try adjusting the threshold slider in the sidebar.")
 
 # -----------------------------------------------------------------------------
 # TAB 2: SPECTROGRAM & WAVEFORM VISUALIZER
