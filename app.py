@@ -404,7 +404,7 @@ if uploaded_file is not None:
     telemetry = calculate_audio_telemetry(y, orig_sr, duration)
     indices = compute_ecoacoustic_indices(y, sr)
     
-    with st.spinner("🧠 Running Google Perch 2.0 neural network inference..."):
+    with st.spinner("🧠 Running neural network inference..."):
         df_detections = run_perch_inference(y, sr, score_threshold=conf_threshold)
 
 # -----------------------------------------------------------------------------
@@ -639,8 +639,6 @@ with tab4:
     This workstation integrates multi-layered bioacoustics classification pipelines tailored for wildlife conservation:
     
     * **Foundation Neural Models:** Leverages Google Perch 2.0 (`perch_v2` preset) and eBird Clements taxonomy database (`ebird2021` / `ebird2022`).
-    * **Localized Domain Adaptation:** Incorporates transfer learning and fine-tuning specifically for endemic and rare Malagasy species (e.g., *Foudia madagascariensis*, *Copsychus albospecularis*).
-    * **Uncertainty Quantification & Calibration:** Prevents false positives in noisy tropical forest environments by calibrating prediction logits with confidence thresholds.
     * **Ecoacoustic Health Diagnostics:** Automatically computes ACI, BI, and NDSI soundscape indices directly from signal spectral frames to evaluate ecosystem biophony versus human noise.
     """)
 
